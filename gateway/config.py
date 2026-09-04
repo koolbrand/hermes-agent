@@ -2555,7 +2555,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "send_read_receipts": is_truthy_value(getenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true")),
         })
         bluebubbles_require_mention = getenv("BLUEBUBBLES_REQUIRE_MENTION")
-        if bluebubbles_require_mention is not None:
+        if bluebubbles_require_mention is not None and bluebubbles_require_mention != "":
             config.platforms[Platform.BLUEBUBBLES].extra["require_mention"] = (
                 bluebubbles_require_mention.lower() in {"true", "1", "yes", "on"}
             )
