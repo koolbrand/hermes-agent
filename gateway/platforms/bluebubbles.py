@@ -145,18 +145,34 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return compile_mention_patterns(raw, log_prefix="bluebubbles", defaults=DEFAULT_MENTION_PATTERNS,
                                         logger_=logger)
 
-    def _mentioned_by_entity(self, record: Dict[str, Any]) -> bool:
+    async def _mentioned_by_entity(self, record: Dict[str, Any]) -> bool:
         """True when the message carries a confirmed iMessage @-mention of us.
 
-        Messages turns a typed @bianka into a mention *entity* and drops the
-        @ from the plain text ("Bianka qué día es hoy"), so a pattern that
-        requires the literal @ can never match on iMessage.  BlueBubbles ships
-        the entity in attributedBody runs as __kIMMentionConfirmedMention
-        (the mentioned handle).  We re-run the mention patterns against
-        "@" + local-part of that handle, so the same YAML rule governs both.
+        Messages turns a typed ``@bianka`` into a mention *entity* and drops the
+        ``@`` from the plain text (``"Bianka qué día es hoy"``), so a pattern that
+        requires the literal ``@`` can never match on iMessage.  BlueBubbles keeps
+        the entity in ``attributedBody`` runs as ``__kIMMentionConfirmedMention``
+        (the mentioned handle) — but its webhook events ship ``attributedBody:
+        null``, so when the record lacks it we fetch the message once with
+        ``?with=attributedBody``.  We re-run the mention patterns against
+        ``"@" + local-part`` of that handle, so the same YAML rule governs both.
         """
+        if not self._mention_patterns:
+            return False
         body = record.get("attributedBody")
-        if not body or not self._mention_patterns:
+        if not body:
+            guid = self._value(record.get("guid"), record.get("messageGuid"), record.get("id"))
+            if not guid:
+                return False
+            try:
+                res = await asyncio.wait_for(
+                    self._api_get(f"/api/v1/message/{guid}?with=attributedBody"), timeout=5
+                )
+                body = (res.get("data") or {}).get("attributedBody")
+            except Exception as exc:  # noqa: BLE001 — best effort; no mention on failure
+                logger.debug("[bluebubbles] attributedBody fetch failed for %s: %s", guid, exc)
+                return False
+        if not body:
             return False
         if isinstance(body, dict):
             body = [body]
@@ -609,7 +625,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
         if is_group and self.require_mention:
-            if not (self._message_matches_mention_patterns(text) or self._mentioned_by_entity(record)):
+            if not (self._message_matches_mention_patterns(text) or await self._mentioned_by_entity(record)):
                 logger.debug("[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)")
                 return _ok()
             text = self._clean_mention_text(text)

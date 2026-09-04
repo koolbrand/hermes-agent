@@ -160,6 +160,52 @@ class TestBlueBubblesMentionGating:
         assert len(handled) == 1
 
     @pytest.mark.asyncio
+    async def test_group_mention_entity_is_fetched_when_webhook_omits_attributed_body(self, monkeypatch):
+        """BlueBubbles webhook events ship ``attributedBody: null``; the adapter
+        must fetch the message with ``?with=attributedBody`` before deciding."""
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention=True,
+            mention_patterns=[r"(?<![\w@])@bianka\b[,:\-]?"],
+            send_read_receipts=False,
+        )
+        handled, fetched = [], []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        async def no_context(*_a, **_k):
+            return ""
+
+        async def fake_api_get(path):
+            fetched.append(path)
+            return {"data": {"attributedBody": [{
+                "string": "Bianka qué día es hoy",
+                "runs": [{"range": [0, 6], "attributes": {"__kIMMentionConfirmedMention": "bianka@koolbrand.com"}}],
+            }]}}
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "_fetch_chat_context", no_context, raising=False)
+        monkeypatch.setattr(adapter, "_api_get", fake_api_get)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-4",
+                "text": "Bianka qué día es hoy",
+                "attributedBody": None,
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "any;+;group-chat"}],
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert fetched == ["/api/v1/message/msg-4?with=attributedBody"]
+        assert len(handled) == 1
+
+    @pytest.mark.asyncio
     async def test_group_message_mentioning_someone_else_is_skipped(self, monkeypatch):
         adapter = _make_adapter(
             monkeypatch,
@@ -173,6 +219,11 @@ class TestBlueBubblesMentionGating:
 
         monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
         adapter._mention_patterns = adapter._compile_mention_patterns([r"(?<![\w@])@bianka\b[,:\-]?"])
+
+        async def no_fetch(path):
+            raise AssertionError("no debe consultar la API si el webhook ya trae attributedBody")
+
+        monkeypatch.setattr(adapter, "_api_get", no_fetch)
         response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
             "type": "new-message",
             "data": {
