@@ -1144,11 +1144,17 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 record.get("id"),
             )
             try:
-                channel_context = await self._fetch_chat_context(
-                    chat_guid=chat_guid,
-                    current_message_guid=current_msg_guid,
-                    limit=20,
+                channel_context = await asyncio.wait_for(
+                    self._fetch_chat_context(
+                        chat_guid=chat_guid,
+                        current_message_guid=current_msg_guid,
+                        limit=20,
+                    ),
+                    timeout=5.0,
                 )
+            except asyncio.TimeoutError:
+                logger.debug("[bluebubbles] channel_context fetch timed out after 5s")
+                channel_context = None
             except Exception as exc:
                 logger.debug("[bluebubbles] channel_context fetch failed: %s", exc)
                 channel_context = None
