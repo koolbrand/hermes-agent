@@ -145,6 +145,31 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return compile_mention_patterns(raw, log_prefix="bluebubbles", defaults=DEFAULT_MENTION_PATTERNS,
                                         logger_=logger)
 
+    def _mentioned_by_entity(self, record: Dict[str, Any]) -> bool:
+        """True when the message carries a confirmed iMessage @-mention of us.
+
+        Messages turns a typed @bianka into a mention *entity* and drops the
+        @ from the plain text ("Bianka qué día es hoy"), so a pattern that
+        requires the literal @ can never match on iMessage.  BlueBubbles ships
+        the entity in attributedBody runs as __kIMMentionConfirmedMention
+        (the mentioned handle).  We re-run the mention patterns against
+        "@" + local-part of that handle, so the same YAML rule governs both.
+        """
+        body = record.get("attributedBody")
+        if not body or not self._mention_patterns:
+            return False
+        if isinstance(body, dict):
+            body = [body]
+        for part in body if isinstance(body, list) else []:
+            for run in (part or {}).get("runs") or []:
+                handle = ((run or {}).get("attributes") or {}).get("__kIMMentionConfirmedMention")
+                if not handle:
+                    continue
+                local = str(handle).split("@", 1)[0].lstrip("+")
+                if any(p.search("@" + local) for p in self._mention_patterns):
+                    return True
+        return False
+
     def _message_matches_mention_patterns(self, text: str) -> bool:
         return bool(text) and any(pattern.search(text) for pattern in self._mention_patterns)
 
@@ -584,7 +609,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
         if is_group and self.require_mention:
-            if not self._message_matches_mention_patterns(text):
+            if not (self._message_matches_mention_patterns(text) or self._mentioned_by_entity(record)):
                 logger.debug("[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)")
                 return _ok()
             text = self._clean_mention_text(text)

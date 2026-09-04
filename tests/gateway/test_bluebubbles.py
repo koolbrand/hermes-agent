@@ -115,6 +115,84 @@ class TestBlueBubblesMentionGating:
         assert response.status == 200
         assert handled == []
 
+    @pytest.mark.asyncio
+    async def test_group_message_with_confirmed_mention_entity_is_processed(self, monkeypatch):
+        """iMessage turns a typed ``@bianka`` into a mention entity and strips the
+        ``@`` from the plain text, so the literal pattern can never match; the
+        ``__kIMMentionConfirmedMention`` run in ``attributedBody`` must count."""
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention=True,
+            mention_patterns=[r"(?<![\w@])@bianka\b[,:\-]?"],  # la regla de producción: @ obligatoria
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        async def no_context(*_a, **_k):
+            return ""
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "_fetch_chat_context", no_context, raising=False)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-2",
+                "text": "Bianka qué día es hoy",
+                "attributedBody": [{
+                    "string": "Bianka qué día es hoy",
+                    "runs": [
+                        {"range": [0, 6], "attributes": {"__kIMMentionConfirmedMention": "bianka@koolbrand.com"}},
+                        {"range": [6, 15], "attributes": {}},
+                    ],
+                }],
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "any;+;group-chat"}],
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert len(handled) == 1
+
+    @pytest.mark.asyncio
+    async def test_group_message_mentioning_someone_else_is_skipped(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention=True,
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        adapter._mention_patterns = adapter._compile_mention_patterns([r"(?<![\w@])@bianka\b[,:\-]?"])
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-3",
+                "text": "Alba qué día es hoy",
+                "attributedBody": [{
+                    "string": "Alba qué día es hoy",
+                    "runs": [{"range": [0, 4], "attributes": {"__kIMMentionConfirmedMention": "alba@koolbrand.com"}}],
+                }],
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "any;+;group-chat"}],
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
 
 class TestBlueBubblesWebhookParsing:
 
