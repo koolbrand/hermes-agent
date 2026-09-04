@@ -8935,6 +8935,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_strict_mention(self) -> bool:
+        """Return whether the bot ONLY responds to explicit @-mentions in groups.
+
+        When true, reply-to-bot, mentioned-thread memory, and free-response
+        channels are all ignored — the bot stays silent until someone writes
+        ``@bianka`` (or whatever the bot username resolves to).  Mirrors Slack's
+        ``slack.strict_mention`` semantics so all three platforms share the same
+        "only @-mention counts" rule.  Defaults to False (legacy behaviour).
+        """
+        configured = self.config.extra.get("strict_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("TELEGRAM_STRICT_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
@@ -9870,6 +9886,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if not self._telegram_require_mention():
             return True
+        # Strict mention: only @bianka wakes the bot.  Reply-to-bot, mentioned-
+        # thread memory, and free-response channels are all ignored.
+        if self._telegram_strict_mention():
+            return self._message_mentions_bot(message)
         if self._is_reply_to_bot(message):
             return True
         # When guest_mode is True, _is_guest_mention already called

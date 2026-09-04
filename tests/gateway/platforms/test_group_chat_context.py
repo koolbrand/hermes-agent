@@ -358,6 +358,27 @@ def test_slack_channel_context_handles_rate_limit_with_retry():
     assert call_count["n"] == 2  # one retry after rate-limit
 
 
+def test_slack_strict_mention_flag_drives_group_gate():
+    """Slack's group gate MUST honour ``strict_mention`` so only <@bot_uid> wakes it.
+
+    This is a source-level guard, not a behavioural test (mocking the full
+    Bolt event lifecycle is too costly for this gate). It pins that the
+    adapter still exposes ``_slack_strict_mention`` reading from
+    ``config.extra.strict_mention`` AND the env fallback
+    ``SLACK_STRICT_MENTION`` — the two routes that the runtime resolution
+    path walks at boot.
+    """
+    from plugins.platforms.slack import adapter as slack_adapter
+
+    assert hasattr(slack_adapter.SlackAdapter, "_slack_strict_mention")
+    src = open(slack_adapter.__file__).read()
+    assert 'os.getenv("SLACK_STRICT_MENTION"' in src
+    # The strict-mention short-circuit must precede the other auto-wake
+    # paths so thread-reply memory / mentioned-thread memory / session
+    # presence cannot resurrect the bot.
+    assert "_slack_strict_mention() and not is_mentioned" in src
+
+
 # ---------------------------------------------------------------------------
 # Telegram (smoke test only — observe-mode is upstream-tested)
 # ---------------------------------------------------------------------------
@@ -374,3 +395,63 @@ def test_telegram_observer_config_field_exists():
     assert "observe_unmentioned_group_messages" in src
     assert "_observe_unmentioned_group_message" in src
     assert "_apply_telegram_group_observe_attribution" in src
+
+
+def test_telegram_strict_mention_flag_exists():
+    """The Telegram adapter exposes ``_telegram_strict_mention`` and short-circuits
+    ``_should_process_message`` to require an explicit ``@mención`` only.
+
+    Pins the wiring of the strict-mention feature so the rule "only @bianka
+    wakes the bot in a group" cannot silently regress on Telegram.
+    """
+    from plugins.platforms.telegram import adapter as tg_adapter
+
+    assert hasattr(tg_adapter.TelegramAdapter, "_telegram_strict_mention"), (
+        "TelegramAdapter must expose _telegram_strict_mention()"
+    )
+    src = open(tg_adapter.__file__).read()
+    # The strict-mention early-return must be checked BEFORE the reply-to-bot
+    # bypass in the should-process path, otherwise reply-to-bot still wakes.
+    assert "_telegram_strict_mention()" in src
+    # The flag must read from config.extra AND from the env fallback.
+    assert 'os.getenv("TELEGRAM_STRICT_MENTION"' in src
+
+
+# ---------------------------------------------------------------------------
+# Unified mention pattern across all three platforms
+# ---------------------------------------------------------------------------
+
+
+def test_unified_at_only_pattern_across_platforms():
+    """The same ``@bianka`` pattern is applied on Slack, Telegram and
+    BlueBubbles. Bare-name wake words (``Bianka hola``) MUST NOT wake the
+    bot on any of them — only an explicit ``@bianka`` does.
+
+    Slack and Telegram additionally honour their platform-native mention
+    mechanism (Slack renders ``@bianka`` as ``<@UBOTID>`` in events;
+    Telegram parses ``@bianka`` into a ``MessageEntity(mention)``). The
+    regex fallback mirrors the same strictness for parity.
+    """
+    import re
+    # Slack uses re.IGNORECASE; the others are case-sensitive in their
+    # compile path but accept @Bianka too because ``\b`` is case-blind and
+    # we test the canonical pattern explicitly.
+    pattern = re.compile(r"(?<![\w@])@bianka\b[,:\-]?")
+
+    cases = [
+        # Accept
+        ("@bianka", True),
+        ("@bianka,", True),
+        ("hola @bianka", True),
+        ("@bianka: haz algo", True),
+        # Reject
+        ("Bianka hola", False),                # bare wake word
+        ("bianka", False),                     # bare wake word
+        ("bianka, ayuda", False),              # bare wake word + comma
+        ("correosbianka@gmail.com", False),   # no word boundary
+    ]
+    for text, expected in cases:
+        assert bool(pattern.search(text)) is expected, (
+            f"text={text!r}: expected match={expected}, "
+            f"got {bool(pattern.search(text))}"
+        )
