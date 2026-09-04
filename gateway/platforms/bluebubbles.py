@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime
@@ -203,6 +204,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        # Per-chat prior-context cache for @-mention replies (TTL cache,
+        # ``(chat_guid, limit)`` -> (fetched_at, rendered_text)). Keeps the
+        # group-chat fetch bounded so back-to-back mentions in the same
+        # chat don't hit the REST API every turn.
+        self._chat_context_cache: OrderedDict[str, tuple] = OrderedDict()
 
     # ------------------------------------------------------------------
     # API helpers
@@ -809,6 +815,93 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             pass
         return info
 
+    # ------------------------------------------------------------------
+    # Group chat context (rule: read prior chat history when @-mentioned)
+    # ------------------------------------------------------------------
+
+    async def _fetch_chat_context(
+        self,
+        chat_guid: str,
+        current_message_guid: str = "",
+        limit: int = 20,
+    ) -> str:
+        """Fetch the most recent messages from a BlueBubbles chat/group.
+
+        Used when the bot is @-mentioned in a group so it has prior context
+        for its reply. Reads from ``GET /api/v1/chat/<guid>/message`` with
+        ``limit`` and ``sort=DESC``, then formats oldest-to-newest and
+        excludes the current trigger message so it is never duplicated in
+        the injected context.
+
+        Returns a formatted multi-line string, or empty string on failure,
+        when the chat is a 1:1 (no group context needed), or when the
+        server is unreachable. Cached in-process for 30s per chat_guid to
+        avoid hammering the REST API on rapid back-to-back mentions.
+        """
+        if not chat_guid or ";+;" not in chat_guid:
+            # 1:1 chats carry their own context inside the session; no fetch.
+            return ""
+        # In-process TTL cache (bounded dict to avoid unbounded growth).
+        now = time.monotonic()
+        cache_key = f"{chat_guid}:{limit}"
+        cached = self._chat_context_cache.get(cache_key)
+        if cached and (now - cached[0]) < 30.0:
+            return cached[1]
+        try:
+            encoded = quote(chat_guid, safe="")
+            res = await self._api_get(
+                f"/api/v1/chat/{encoded}/message?limit={limit + 1}&offset=0&sort=DESC"
+            )
+        except Exception as exc:
+            logger.debug("[bluebubbles] _fetch_chat_context failed: %s", exc)
+            return ""
+        raw_messages = (res or {}).get("data", []) or []
+        # Drop the current trigger message (already in `text`) and keep
+        # only the most recent ``limit`` prior messages. BlueBubbles
+        # ``GET /chat/<guid>/message`` with sort=DESC returns newest-
+        # first, so the head of the list is the most recent prior message;
+        # we just drop the trigger (if present at the head) and slice.
+        # Reverse the kept slice at the end so the rendered block is
+        # oldest-to-newest — that matches the order humans see in a chat
+        # scrollback and is what the agent expects when reasoning about
+        # the conversation flow.
+        prior: List[Dict[str, Any]] = []
+        for m in raw_messages:
+            guid = m.get("guid") or m.get("messageGuid") or ""
+            if current_message_guid and guid == current_message_guid:
+                continue
+            prior.append(m)
+        # Truncate first (keep the newest N), then reverse for rendering.
+        prior = prior[:limit]
+        prior.reverse()
+        if not prior:
+            return ""
+        rendered: List[str] = []
+        for m in prior:
+            text = (m.get("text") or "").strip()
+            if not text:
+                continue
+            is_from_me = bool(m.get("isFromMe") or m.get("fromMe"))
+            handle = m.get("handle") or {}
+            if isinstance(handle, dict):
+                sender = (handle.get("address") or handle.get("displayName") or "").strip()
+            else:
+                sender = ""
+            if is_from_me:
+                author = self.bot_username or "Bianka"
+            elif sender:
+                author = sender
+            else:
+                author = "unknown"
+            rendered.append(f"{author}: {text}")
+        content = "\n".join(rendered).strip()
+        # Bounded cache (LRU-ish: keep last 256 chats).
+        if content:
+            self._chat_context_cache[cache_key] = (now, content)
+            while len(self._chat_context_cache) > 256:
+                self._chat_context_cache.pop(next(iter(self._chat_context_cache)))
+        return content
+
     def format_message(self, content: str) -> str:
         return strip_markdown(content)
 
@@ -1034,6 +1127,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+        channel_context: Optional[str] = None
         if is_group and self.require_mention:
             if not self._message_matches_mention_patterns(text):
                 logger.debug(
@@ -1041,6 +1135,23 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
                 return web.Response(text="ok")
             text = self._clean_mention_text(text)
+            # Group rule: read prior chat context before replying.
+            # Best-effort; an empty string on failure leaves the message
+            # path unchanged (no error, no retry).
+            current_msg_guid = self._value(
+                record.get("guid"),
+                record.get("messageGuid"),
+                record.get("id"),
+            )
+            try:
+                channel_context = await self._fetch_chat_context(
+                    chat_guid=chat_guid,
+                    current_message_guid=current_msg_guid,
+                    limit=20,
+                )
+            except Exception as exc:
+                logger.debug("[bluebubbles] channel_context fetch failed: %s", exc)
+                channel_context = None
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=chat_identifier or sender,
@@ -1065,6 +1176,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             ),
             media_urls=media_urls,
             media_types=media_types,
+            channel_context=channel_context,
         )
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
