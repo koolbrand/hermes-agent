@@ -55,7 +55,9 @@ def _make_bb_adapter():
     # Mention patterns matching "@bianka" so the test message is admitted.
     from gateway.platforms.helpers import compile_mention_patterns
     adapter._mention_patterns = compile_mention_patterns(
-        [r"(?<![\w@])@?bianka\b[,:\-]?"],
+        # Live runtime pattern: the @ is mandatory. Bare "Bianka" without
+        # the @ must NOT wake the agent — only an explicit @bianka does.
+        [r"(?<![\w@])@bianka\b[,:\-]?"],
         log_prefix="[bluebubbles:test] ",
     )
     return adapter
@@ -224,6 +226,36 @@ def test_bluebubbles_webhook_skips_group_without_at_mention():
     # Acknowledged without dispatching the agent.
     assert response.text == "ok"
     adapter.handle_message.assert_not_called()
+
+
+def test_bluebubbles_wake_word_without_at_does_not_trigger():
+    """\"Bianka hola\" must NOT trigger — only @bianka (with the @) does.
+
+    Bare name \"Bianka\" appears in normal conversation; without the @ it is
+    not an address. The mention pattern requires the literal \"@\" so the
+    agent is not woken by people talking about / to someone named Bianka
+    by name.
+    """
+    adapter = _make_bb_adapter()
+    # Use the live mention patterns the runtime now has — the @ is mandatory.
+    adapter.client = MagicMock()
+    adapter.build_source = lambda **kw: SimpleNamespace(**kw)
+    adapter.handle_message = AsyncMock()
+
+    cases = [
+        ("Bianka hola", False),                 # bare wake word → reject
+        ("bianka, ayuda", False),               # bare wake + comma → reject
+        ("@bianka hola", True),                 # @ + name → admit
+        ("hola @bianka, mira esto", True),      # mid-message @ → admit
+        ("@Bianka: haz algo", True),            # @ + capital + colon → admit
+        (" @bianka", True),                     # leading space → admit
+        ("correosbianka@gmail.com", False),     # no word boundary → reject
+    ]
+    for text, expected in cases:
+        matched = adapter._message_matches_mention_patterns(text)
+        assert matched is expected, (
+            f"text={text!r}: expected match={expected}, got {matched}"
+        )
 
 
 # ---------------------------------------------------------------------------
