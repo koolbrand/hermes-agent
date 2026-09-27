@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from tools.mcp_tool import MCPServerTask, _MCP_AVAILABLE
 from tools.mcp_tool_errors import _format_connect_error
+from tools.mcp_tool_common import _prepend_path
 from tools.mcp_tool_config import _node_fallback, _resolve_stdio_command
+from tools.mcp_tool_config import _which_with_config_pathext
 
 # Ensure the mcp module symbols exist for patching even when the SDK isn't installed
 if not _MCP_AVAILABLE:
@@ -108,6 +110,158 @@ def test_resolve_stdio_command_falls_back_to_usr_local_bin():
 
 
 # ---------------------------------------------------------------------------
+# #37589: Desktop/launchd processes inherit a minimal PATH on macOS that does
+# not include ~/.local/bin, /opt/homebrew/bin, or /usr/local/bin. The resolver
+# must locate bare uv/uvx (the dominant Python MCP-server runtime) under those
+# locations instead of failing with ENOENT at execvp.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_stdio_command_finds_uvx_in_user_local_bin(tmp_path, monkeypatch):
+    """uv's official installer drops uv/uvx at ``~/.local/bin/uvx`` on macOS and
+    Linux. The resolver must pick it up when the GUI PATH doesn't include that
+    directory (#37589)."""
+    local_bin = tmp_path / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    uvx_path = local_bin / "uvx"
+    uvx_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    uvx_path.chmod(0o755)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    with patch("tools.mcp_tool_config.shutil.which", return_value=None):
+        command, env = _resolve_stdio_command("uvx", {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+
+    assert command == str(uvx_path)
+    # The resolver prepended the chosen bin so uvx's sibling `uv` and its
+    # shebang-resolved children resolve in the same directory.
+    assert env["PATH"].split(os.pathsep)[0] == str(local_bin)
+
+
+def test_resolve_stdio_command_uv_fallback_order(tmp_path, monkeypatch):
+    """Bare uv/uvx probe the well-known install dirs in uv's install order:
+    managed ``<HERMES_HOME>/bin`` first, then ``~/.local/bin``, then Homebrew
+    (Apple Silicon, then Intel/from-source)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
+    monkeypatch.setattr("tools.mcp_tool_config.os.path.expanduser", lambda p: p.replace("~", str(tmp_path / "user")) if p.startswith("~") else p)
+
+    candidates = [
+        os.path.join(str(tmp_path / "hermes"), "bin", "uvx"),
+        os.path.join(str(tmp_path / "user"), ".local", "bin", "uvx"),
+        os.path.join(os.sep, "opt", "homebrew", "bin", "uvx"),
+        os.path.join(os.sep, "usr", "local", "bin", "uvx"),
+    ]
+    seen = []
+
+    def _fake_access(path, mode):
+        assert mode == os.X_OK
+        seen.append(path)
+        return path == candidates[-1]  # only /usr/local/bin exists
+
+    with patch("tools.mcp_tool_config.shutil.which", return_value=None), \
+         patch("tools.mcp_tool_config.os.path.isfile", return_value=True), \
+         patch("tools.mcp_tool_config.os.access", side_effect=_fake_access):
+        command, _env = _resolve_stdio_command("uvx", {"PATH": "/usr/bin"})
+
+    assert seen == candidates  # every dir probed, in install order
+    assert command == candidates[-1]
+
+
+def test_resolve_stdio_command_uvx_unchanged_when_already_on_path():
+    """A shutil.which hit still takes precedence — don't double-resolve a working
+    bare command on the child's own PATH into something else."""
+    resolved_path = "/some/custom/bin/uvx"
+    with patch("tools.mcp_tool_config.shutil.which", return_value=resolved_path):
+        command, _env = _resolve_stdio_command("uvx", {"PATH": "/usr/bin"})
+
+    assert command == resolved_path
+
+
+def test_resolve_stdio_command_skips_unknown_commands():
+    """Bare command names outside the npx/npm/node/uv/uvx launcher set must NOT
+    be matched against the fallback paths — that would rewrite ``command:
+    my-tool`` into a coincidentally-named file at /opt/homebrew/bin/my-tool."""
+    with patch("tools.mcp_tool_config.shutil.which", return_value=None), \
+         patch("tools.mcp_tool_config.os.path.isfile", return_value=True), \
+         patch("tools.mcp_tool_config.os.access", return_value=True):
+        command, _env = _resolve_stdio_command("my-tool", {"PATH": "/usr/bin:/bin"})
+
+    assert command == "my-tool"
+
+
+def test_resolve_stdio_command_absent_path_is_a_miss(tmp_path, monkeypatch):
+    """A server env without PATH must not resolve commands against the PARENT's PATH:
+    the child would be spawned without it and the lookup would pass on an env the
+    child never sees. Bare ``node`` still reaches the explicit well-known dirs."""
+    parent_bin = tmp_path / "parent-bin"
+    parent_bin.mkdir()
+    server_tool = parent_bin / "some-mcp-server"
+    server_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    server_tool.chmod(0o755)
+    node_tool = tmp_path / "node" / "bin" / "node"
+    node_tool.parent.mkdir(parents=True)
+    node_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    node_tool.chmod(0o755)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # the parent PATH contains BOTH names: an ambient hit would resolve either
+    monkeypatch.setenv("PATH", str(parent_bin))
+
+    command, _env = _resolve_stdio_command("some-mcp-server", {"OTHER": "1"})
+
+    # absent child PATH: honest miss, not an ambient hit
+    assert command == "some-mcp-server"
+
+    with patch.dict("os.environ", {"PATH": str(parent_bin)}):
+        command, _env = _resolve_stdio_command("node", {"OTHER": "1"})
+    assert command == str(node_tool)  # the explicit Node fallback dirs stay reachable
+
+
+def test_resolve_stdio_command_empty_path_is_a_miss(monkeypatch, tmp_path):
+    """An explicitly empty child PATH keeps its cwd-only meaning (never the parent's PATH):
+    ``which`` sees ``[""]`` -> cwd. The binary lives only in the parent's PATH dir, so the
+    lookup must miss rather than silently inheriting the parent's directories."""
+    parent_bin = tmp_path / "parent-bin"
+    parent_bin.mkdir()
+    server_tool = parent_bin / "other-mcp-server"
+    server_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    server_tool.chmod(0o755)
+    monkeypatch.setenv("PATH", str(parent_bin))
+
+    command, _env = _resolve_stdio_command("other-mcp-server", {"PATH": ""})
+
+    assert command == "other-mcp-server"  # cwd-only lookup: no ambient fallback
+
+
+def test_config_pathext_lookup_never_touches_parent_environ(tmp_path, monkeypatch):
+    """Resolving under a configured PATHEXT must not mutate the parent's ``os.environ``:
+    a multiplexed gateway resolves servers for several profiles from one process, and
+    any thread reading PATHEXT (or inheriting env for its own subprocess) inside the
+    lookup window would otherwise see this server's per-profile value."""
+    server_dir = tmp_path / "bin"
+    server_dir.mkdir()
+    (server_dir / "server.cmd").write_text("@echo off\r\n", encoding="utf-8")
+    (server_dir / "server.cmd").chmod(0o755)
+    monkeypatch.delenv("PATHEXT", raising=False)
+    monkeypatch.setenv("PATH", str(server_dir))
+    seen = {}
+
+    import tools.mcp_tool_config as _cfg
+
+    def _spy(cmd, path=None):
+        seen["PATHEXT"] = os.environ.get("PATHEXT")
+        raise AssertionError("shutil.which must not be the lookup engine here")
+
+    with patch.object(_cfg.shutil, "which", side_effect=_spy):
+        cfg_env = {"PATHEXT": ".cmd;.exe"}
+        hit = _which_with_config_pathext("server", str(server_dir), cfg_env)
+
+    assert hit == str(server_dir / "server.cmd")
+    assert "PATHEXT" not in os.environ  # not written, not left behind
+    assert seen == {}  # and never consulted mid-lookup either
+
+
+# ---------------------------------------------------------------------------
 # #29184: OSV malware preflight must not block the asyncio event loop, and a
 # stalled check must time out fail-open rather than freezing MCP startup.
 # ---------------------------------------------------------------------------
@@ -187,3 +341,66 @@ def test_run_stdio_malware_check_times_out_fail_open():
         assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
 
     asyncio.run(_test())
+
+
+# ---------------------------------------------------------------------------
+# #82309: a managed dir that is ALREADY on the child's PATH (the Hermes
+# installer appends its managed Node dir) must still end up FIRST. "Prepend
+# only when absent" left the older system Node ahead of it, so npm lifecycle
+# children (`node install.js`) resolved the system Node and died with
+# ERR_REQUIRE_ESM even though Hermes had provisioned a compatible runtime.
+# ---------------------------------------------------------------------------
+
+
+def test_prepend_path_makes_an_already_present_dir_first():
+    """The reported layout — system Node first, managed dir already present
+    behind it — must come out with the managed dir first."""
+    managed = os.path.join(os.sep, "managed", "node", "bin")
+    system = os.path.join(os.sep, "system", "node")
+    env = _prepend_path({"PATH": os.pathsep.join([system, "mid-dir", managed]), "KEEP": "v"}, managed)
+
+    assert env["PATH"].split(os.pathsep) == [managed, system, "mid-dir"]
+    assert env["KEEP"] == "v"
+
+
+def test_prepend_path_collapses_duplicate_entries():
+    """Prepending an already-present dir must not grow PATH a duplicate."""
+    managed = "/managed/node/bin"
+    env = _prepend_path({"PATH": os.pathsep.join([managed, "/usr/bin", managed])}, managed)
+
+    assert env["PATH"].split(os.pathsep) == [managed, "/usr/bin"]
+
+
+def test_prepend_path_collapses_windows_case_and_separator_variants(monkeypatch):
+    """Windows PATH lookup is case- and separator-insensitive, so every variant
+    of the managed dir has to be removed for the canonical entry to win."""
+    monkeypatch.setattr(os, "pathsep", ";")
+    monkeypatch.setattr(sys, "platform", "win32")
+    managed = r"C:\Users\x\AppData\Local\hermes\node"
+    variant = "c:\\users\\x\\appdata\\local\\hermes\\node" + "\\"
+    env = _prepend_path(
+        {"PATH": ";".join([r"C:\Program Files\nodejs", variant, r"C:\tools"])}, managed
+    )
+
+    assert env["PATH"].split(";") == [managed, r"C:\Program Files\nodejs", r"C:\tools"]
+
+
+def test_resolve_stdio_command_displaces_a_system_node_already_on_path(tmp_path, monkeypatch):
+    """End-to-end: with the managed dir already on the child PATH behind a system
+    Node dir, the resolved env must put the managed dir first so the spawned
+    launcher's shebang/children (`/usr/bin/env node`) get the managed Node."""
+    node_bin = tmp_path / "node" / "bin"
+    node_bin.mkdir(parents=True)
+    npx_path = node_bin / "npx"
+    npx_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    npx_path.chmod(0o755)
+    system_bin = tmp_path / "system-node"
+    system_bin.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    inherited = os.pathsep.join([str(system_bin), "/usr/bin", str(node_bin)])
+
+    with patch("tools.mcp_tool_config.shutil.which", return_value=None):
+        command, env = _resolve_stdio_command("npx", {"PATH": inherited})
+
+    assert command == str(npx_path)
+    assert env["PATH"].split(os.pathsep) == [str(node_bin), str(system_bin), "/usr/bin"]
