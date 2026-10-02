@@ -580,12 +580,23 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
     return system
 
 
+def _is_minimax_m31(model: str) -> bool:
+    """Koolbrand (2-oct-2026): MiniMax-M3.1-Flash-Preview razona SIEMPRE (disable = 400) y su esfuerzo por
+    defecto es `max`. El formato manual (enabled + budget_tokens) lo acepta pero no deja bajarlo, así que se
+    le manda adaptive + output_config.effort. Esfuerzo por HERMES_MINIMAX_M31_EFFORT (por defecto low):
+    en la prueba de agente de Bianka, low fue el más rápido sin gastar más tokens que M3."""
+    return "minimax-m3.1" in (model or "").lower()
+
+
 def _thinking_kwargs(reasoning_config: Dict[str, Any], model: str, effective_max_tokens: int) -> Dict[str, Any]:
     """Map ``reasoning_config`` to Anthropic thinking kwargs. Adaptive models (Claude 4.6+,
     Kimi/Moonshot) get ``thinking.type=adaptive`` + ``output_config.effort``; older models and
     manual-only compat endpoints (MiniMax) get budget_tokens. Haiku has no extended thinking. On
     4.7+ ``thinking.display`` defaults to "omitted", hiding the reasoning Hermes shows in its CLI,
     so "summarized" is requested to keep the activity feed populated."""
+    if _is_minimax_m31(model):
+        return {"thinking": {"type": "adaptive"},
+                "output_config": {"effort": os.environ.get("HERMES_MINIMAX_M31_EFFORT", "low")}}
     if reasoning_config.get("enabled") is False:
         # Adaptive models think by DEFAULT, so omitting the parameter is not a disable — the user
         # silently keeps paying. Mandatory-thinking models 400 on the disable, so they keep the
